@@ -2,6 +2,28 @@
 
 // for information how FX metadata strings work see https://kno.wled.ge/interfaces/json-api/#effect-metadata
 
+#if !(defined(WLED_DISABLE_PARTICLESYSTEM2D) && defined(WLED_DISABLE_PARTICLESYSTEM1D))
+  #include "FXparticleSystem.h" // include particle system code only if at least one system is enabled
+  #ifdef WLED_DISABLE_PARTICLESYSTEM2D
+    #define WLED_PS_DONT_REPLACE_2D_FX
+  #endif
+  #ifdef WLED_DISABLE_PARTICLESYSTEM1D
+    #define WLED_PS_DONT_REPLACE_1D_FX
+  #endif
+  #ifdef ESP8266
+    #if !defined(WLED_DISABLE_PARTICLESYSTEM2D) && !defined(WLED_DISABLE_PARTICLESYSTEM1D)
+      #error ESP8266 does not support 1D and 2D particle systems simultaneously. Please disable one of them.
+    #endif
+  #endif
+#else
+  #define WLED_PS_DONT_REPLACE_1D_FX
+  #define WLED_PS_DONT_REPLACE_2D_FX
+#endif
+#ifdef WLED_PS_DONT_REPLACE_FX
+  #define WLED_PS_DONT_REPLACE_1D_FX
+  #define WLED_PS_DONT_REPLACE_2D_FX
+#endif
+
 // paletteBlend: 0 - wrap when moving, 1 - always wrap, 2 - never wrap, 3 - none (undefined)
 #define PALETTE_SOLID_WRAP   (paletteBlend == 1 || paletteBlend == 3)
 
@@ -1599,6 +1621,269 @@ static void mode_dissolveplus(void) {
 static const char _data_FX_MODE_DISSOLVEPLUS[] PROGMEM = "Dissolve Plus@Repeat speed,Dissolve speed,Fill speed,Last one delay,Fade rate,Random,Complete,Last one;!,!;!;;o2=1";
 
 
+/*
+/  PS Pendulum effect (uses the Particle System)
+*   by Bob Loeffler and claude.ai   Particle System by dedehai
+*   First slider (speed) is for the speed of the pendulum LED going back and forth. (0 = random speed)
+*   Second slider (intensity) is for the X offset.  In the middle means the center of the pendulum will be in the middle of the LED strip.
+*     Moving the slider left will move the pendulum to the left, etc. (0 = random X offset)
+*   Third slider (blur) is for how much of a trail the pendulum will leave.
+*   Fourth slider (pause/delay) is for how long the effect will pause before restarting the pendulum movement.
+*   Fifth slider (gravity/damping) is for how much the pendulum movement will be dampened due to gravity or friction. (0 = random damping)
+*   Checkbox1 will select the LED color based on it's position on the strip.
+*   Checkbox2 will make the pendulum swing forever (a perpetual pendulum).
+*   aux0 stores the settings checksum to detect changes.
+*/
+#define PENDULUM_MIN_AMPLITUDE_SUBPX ((PS_P_RADIUS_1D * 2) / 5)
+
+// Custom pendulum state, stored in the extra bytes after the particle system's own data
+typedef struct {
+  int32_t  currentPos;     // sub-pixel position (scaled by PS_P_RADIUS_1D); matches particle.x units directly
+  int32_t  fromPos;
+  int32_t  toPos;
+  int32_t  amplitude;      // sub-pixel
+  uint16_t damping256;     // Q8 fixed point: 0-255 represents 0.0-1.0
+  uint32_t swingStart;
+  uint32_t swingDuration;
+  uint32_t pauseStart;
+  uint16_t swing_time;
+  uint16_t offsetX;        // pixel units (kept as pixels since map() needs it that way)
+  uint8_t  phase;
+  uint8_t  goingLeft;
+} PendulumData;
+
+void mode_particlePendulum(void) {
+  ParticleSystem1D *PartSys = nullptr;
+  PendulumData *pd = nullptr;
+
+  if (SEGMENT.call == 0) {
+    if (!initParticleSystem1D(PartSys, 0, 1, sizeof(PendulumData)))
+      FX_FALLBACK_STATIC;
+  } else {
+    PartSys = reinterpret_cast<ParticleSystem1D *>(SEGENV.data);
+  }
+  if (PartSys == nullptr) FX_FALLBACK_STATIC;
+
+  PartSys->updateSystem();
+  pd = reinterpret_cast<PendulumData *>(PartSys->PSdataEnd);
+
+  uint16_t segLen      = SEGLEN;
+  uint16_t segCenter   = segLen / 2;
+  uint16_t pause_delay = map(SEGMENT.custom2, 0, 255, 500, 20000);
+  uint16_t cutoff      = segLen / 10;
+
+  constexpr uint8_t PHASE_STOPPED = 0U;
+  constexpr uint8_t PHASE_SWING   = 1U;
+  constexpr uint8_t PHASE_PAUSED  = 2U;
+
+  PartSys->setUsedParticles(0);
+  PartSys->setWrap(false);
+  PartSys->setBounce(false);
+
+  uint32_t loss = 255 - SEGMENT.custom1; // amount of blurring; using loss spreads out the blur across the whole 1-255 range.
+  loss = (loss * loss) / 255;            // without this, most blur occurred near the highest setting; 0 = no blurring
+  if (SEGMENT.custom1 > 0 && loss < 2) loss = 2;
+  PartSys->setMotionBlur(255 - loss);
+
+  PartSys->setColorByPosition(SEGMENT.check1);
+
+  uint32_t settingssum = SEGMENT.speed + SEGMENT.intensity + SEGMENT.custom1 + SEGMENT.custom2 + SEGMENT.custom3 + SEGMENT.check2;
+  bool settingsChanged = (SEGENV.aux0 != settingssum);
+
+  if (SEGENV.call == 0 || pd->phase == PHASE_STOPPED || settingsChanged) {
+    const uint8_t speed = SEGMENT.speed;
+    if (speed == 0) pd->swing_time = hw_random16(1000, 2400);
+    else pd->swing_time = map(speed, 1, 255, 2400, 400);
+
+    const uint8_t intensity = SEGMENT.intensity;
+    if (intensity == 0) pd->offsetX = hw_random16(cutoff, segLen - cutoff);
+    else pd->offsetX = map(intensity, 1, 255, cutoff, segLen - cutoff);
+
+    // Damping as Q8 fixed-point (0-256 = 0.0-1.0)
+    const uint8_t custom3 = SEGMENT.custom3;
+    uint8_t dampingPct;
+    if (custom3 == 0) dampingPct = hw_random8(75, 95);
+    else dampingPct = map(custom3, 1, 31, 95, 75);
+    pd->damping256 = ((uint16_t)dampingPct * 256) / 100;
+
+    // Amplitude in pixels first, then converted to sub-pixel units
+    uint16_t amplitude_px;
+    if (pd->offsetX < segCenter) amplitude_px = pd->offsetX;
+    else amplitude_px = MIN(pd->offsetX, (uint16_t)(segLen - 1 - pd->offsetX));
+    pd->amplitude = (int32_t)amplitude_px * PS_P_RADIUS_1D;
+
+    pd->fromPos       = (int32_t)pd->offsetX * PS_P_RADIUS_1D;
+    pd->toPos         = pd->fromPos - pd->amplitude;
+    pd->swingStart    = strip.now;
+    pd->swingDuration = pd->swing_time;
+    pd->phase         = PHASE_SWING;
+    pd->goingLeft     = 1;
+    pd->currentPos    = pd->fromPos;
+
+    PartSys->particles[0].ttl = 300;
+    PartSys->particleFlags[0].perpetual = true;
+    PartSys->particleFlags[0].fixed     = true;
+
+    SEGENV.aux0 = settingssum;
+  }
+
+  if (pd->phase == PHASE_SWING) {
+    uint32_t elapsed = strip.now - pd->swingStart;
+    if (elapsed > pd->swingDuration) elapsed = pd->swingDuration;
+
+    // angle: 0 -> 32768 represents 0 -> 180 degrees in cos16_t's 16-bit angle space
+    uint32_t angle = pd->swingDuration ? ((uint32_t)elapsed * 32768) / pd->swingDuration : 32768;
+
+    int32_t cosT16 = cos16_t((uint16_t)angle);       // inferred range: -32767..32767
+    int32_t frac16 = (32767 - cosT16) >> 1;          // 0..32767, represents ease fraction * 32767
+
+    int32_t delta = pd->toPos - pd->fromPos;         // sub-pixel
+    pd->currentPos = pd->fromPos + (int32_t)(((int64_t)delta * frac16) / 32767);
+
+    if (elapsed >= pd->swingDuration) {
+      bool perpetual = SEGMENT.check2;
+      if (!perpetual) {
+        pd->amplitude = (pd->amplitude * (int32_t)pd->damping256) >> 8;  // (Q8 fixed-point)
+      }
+
+      if (!perpetual && pd->amplitude < PENDULUM_MIN_AMPLITUDE_SUBPX) {
+        pd->currentPos = (int32_t)pd->offsetX * PS_P_RADIUS_1D;
+        pd->phase      = PHASE_PAUSED;
+        pd->pauseStart = strip.now;
+      } else {
+        int32_t offsetSubpx = (int32_t)pd->offsetX * PS_P_RADIUS_1D;
+        int32_t nextTo = offsetSubpx + (pd->goingLeft ? pd->amplitude : -pd->amplitude);
+        pd->fromPos    = pd->toPos;
+        pd->toPos      = nextTo;
+        pd->goingLeft  = !(pd->goingLeft);
+        pd->swingStart = strip.now;
+
+        // duration scales with amplitude/half-segment-length, in Q8 fixed-point
+        int32_t halfSegSubpx = ((int32_t)(segLen - 1) * PS_P_RADIUS_1D) / 2;
+        int32_t ratio256 = halfSegSubpx ? (pd->amplitude * 256) / halfSegSubpx : 256;
+        uint32_t dur = ((uint32_t)pd->swing_time * ratio256) >> 8;
+        pd->swingDuration = (dur < 200) ? 200 : dur;
+      }
+    }
+  } else if (pd->phase == PHASE_PAUSED) {
+    pd->currentPos = (int32_t)pd->offsetX * PS_P_RADIUS_1D;
+    if (strip.now - pd->pauseStart >= pause_delay) {
+      pd->phase = PHASE_STOPPED;
+    }
+  }
+
+  PartSys->particles[0].x  = pd->currentPos;
+  PartSys->particles[0].vx = 0;
+
+  PartSys->update();
+}
+static const char _data_FX_MODE_PS_PENDULUM[] PROGMEM = "PS Pendulum@Speed (0=random),X Offset (0=random),Blur,Pause/Delay,Damping/Gravity (0=random), Position Color, Perpetual;!,!;!;1;c2=32,c3=4,o1=1";
+
+
+/*
+/  Solar Flare effect
+*   2D magma/lava animation
+*   Adapted from FireLamp_JeeUI implementation (https://github.com/DmytroKorniienko/FireLamp_JeeUI/tree/dev)
+*   Original idea by SottNick, remastered by kostyamat
+*   Adapted to WLED by Bob Loeffler and claude.ai
+*   First slider (speed) is for the speed of the moving magma and lava bombs.
+*   Second slider (intensity) is for the number of lava bombs (particles).  The max # is 1/2 the number of columns on the 2D matrix.
+*   Third slider (gravity) is for how high the lava bombs will go.
+*   The color palette is currently fixed, but may be user selectable in the future.
+*   aux0 stores the settings checksum to detect changes
+*/
+static void mode_2D_solarflare(void) {
+  const uint16_t width = SEG_W;
+  const uint16_t height = SEG_H;
+  const uint8_t MAGMA_MAX_PARTICLES = width / 2;
+
+  // Noise parameters - adjust these for different surface/flares characteristics
+  // deltaValue: higher = more detailed/turbulent
+  // deltaHue: higher = taller flare structures
+  //const uint8_t solarDeltaValue = 8U;
+  //const uint8_t solarDeltaHue   = 32U;
+
+  // Allocate memory: particles (4 floats each) + 2 floats for noise counters + shiftHue cache
+  const uint16_t dataSize = (MAGMA_MAX_PARTICLES * 4 + 2) * sizeof(float) + height * sizeof(uint8_t);
+  if (!SEGENV.allocateData(dataSize)) FX_FALLBACK_STATIC;
+  
+  float* particleData = reinterpret_cast<float*>(SEGENV.data);
+  float* ff_y = &particleData[MAGMA_MAX_PARTICLES * 4];
+  float* ff_z = &particleData[MAGMA_MAX_PARTICLES * 4 + 1];
+  uint8_t* shiftHueCache = reinterpret_cast<uint8_t*>(&particleData[MAGMA_MAX_PARTICLES * 4 + 2]);
+  
+  // Check if settings changed
+  uint32_t settingssum = SEGMENT.speed + SEGMENT.intensity + SEGMENT.custom1;
+  bool settingsChanged = (SEGENV.aux0 != settingssum);
+
+  if (SEGENV.call == 0 || settingsChanged) {
+    // Pre-calculate shift hue values
+    for (uint16_t j = 0; j < height; j++) {
+      shiftHueCache[j] = map(j, 0, height + height / 4, 255, 0);
+    }
+    
+    *ff_y = 0.0f;
+    *ff_z = 0.0f;
+    SEGENV.aux0 = settingssum;
+  }
+  
+  // Speed control
+  float speedfactor = SEGMENT.speed / 255.0f;
+  speedfactor = speedfactor * speedfactor * 1.5f;
+  if (speedfactor < 0.001f) speedfactor = 0.001f;
+  
+  // Flare intensity
+  uint8_t solarDeltaValue = map(SEGMENT.intensity, 0, 255, 2, 16);
+
+  // Flare height
+  uint8_t solarDeltaHue = map(SEGMENT.custom1, 0, 255, 12, 52);
+
+  // Fade background
+  SEGMENT.fadeToBlackBy(50);
+  
+  // Pre-calculate color palette lookup table (256 colors)
+  static CRGB colorPalette[256];
+  static bool paletteInitialized = false;
+  if (!paletteInitialized) {
+    for (uint16_t colorIndex = 0; colorIndex < 256; colorIndex++) {
+      if (colorIndex < 64) {
+        colorPalette[colorIndex] = CRGB(colorIndex * 4, 0, 0);
+      } else if (colorIndex < 128) {
+        uint8_t val = (colorIndex - 64) * 4;
+        colorPalette[colorIndex] = CRGB(255, val, 0);
+      } else if (colorIndex < 192) {
+        uint8_t val = (colorIndex - 128) * 4;
+        colorPalette[colorIndex] = CRGB(255, 128 + val / 2, 0);
+      } else {
+        uint8_t val = (colorIndex - 192) * 4;
+        colorPalette[colorIndex] = CRGB(255, 255, val);
+      }
+    }
+    paletteInitialized = true;
+  }
+  
+  // Draw noise-based magma background - optimized
+  uint16_t ff_y_int = (uint16_t)*ff_y;
+  uint16_t ff_z_int = (uint16_t)*ff_z;
+  
+  for (uint16_t i = 0; i < width; i++) {
+    for (uint16_t j = 0; j < height; j++) {
+      uint8_t noise = perlin8(i * solarDeltaValue, (j + ff_y_int) * solarDeltaHue, ff_z_int);
+      uint8_t colorIndex = qsub8(noise, shiftHueCache[j]);
+      if (SEGMENT.check1)
+        SEGMENT.addPixelColorXY(i, height - 1 - j, colorPalette[colorIndex]);
+      else {
+        CRGB col = SEGMENT.color_from_palette(colorIndex, false, PALETTE_SOLID_WRAP, 0);  // Get color from palette
+        SEGMENT.addPixelColorXY(i, height - 1 - j, col);  // magma rises from bottom of display
+      }
+    }
+  }
+  
+  *ff_y += speedfactor * 2.0f;
+  *ff_z += speedfactor;
+}
+static const char _data_FX_MODE_2D_SOLARFLARE[] PROGMEM = "Solar Flare@Speed,Intensity,Height,,,Internal Palette;;!;2;";
+
 
 /////////////////////
 //  UserMod Class  //
@@ -1616,6 +1901,8 @@ class UserFxUsermod : public Usermod {
     strip.addEffect(255, &mode_morsecode, _data_FX_MODE_MORSECODE);
     strip.addEffect(255, &mode_2D_perlinscape, _data_FX_MODE_2D_PERLINSCAPE);
     strip.addEffect(255, &mode_dissolveplus, _data_FX_MODE_DISSOLVEPLUS);
+    strip.addEffect(255, &mode_particlePendulum, _data_FX_MODE_PS_PENDULUM);
+    strip.addEffect(255, &mode_2D_solarflare, _data_FX_MODE_2D_SOLARFLARE);
 
     ////////////////////////////////////////
     //  add your effect function(s) here  //
